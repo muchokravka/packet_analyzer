@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "packet-analyzer"
+version = "0.1.0"
+description = "PCAP parser and AI-ready network analysis exporter"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+packet-analyzer = "packet_analyzer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["packet_analyzer*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
