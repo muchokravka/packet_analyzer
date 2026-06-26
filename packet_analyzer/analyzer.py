@@ -2,14 +2,33 @@ from __future__ import annotations
 
 import base64
 import collections
+import concurrent.futures
 import dataclasses
 import ipaddress
 import json
-import math
+import mmap
+import os
 import re
+import shutil
 import struct
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, IO
+
+from . import detections
+from .pcapng import parse_pcapng
+from .protocols import detect_kerberos, detect_quic, detect_smb, detect_ssh
+from .utils import (
+    DetectionPacket,
+    decode_payload_text,
+    entropy,
+    extract_printable,
+    find_http_header_value,
+    is_private_ip,
+    printable_ratio,
+    SUSPICIOUS_PORTS,
+)
 
 
 ETH_TYPE_IPV4 = 0x0800
@@ -41,26 +60,6 @@ HTTP_METHOD_PREFIXES = (
     b"PATCH ",
     b"OPTIONS ",
 )
-
-PRIVATE_NETS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-]
-
-SUSPICIOUS_PORTS = {
-    21,
-    22,
-    23,
-    445,
-    3389,
-    4444,
-    5555,
-    6667,
-    31337,
-}
 
 
 @dataclasses.dataclass(slots=True)
@@ -97,13 +96,9 @@ class PacketRecord:
     icmp_checksum: int | None
     icmp_id: int | None
     icmp_seq: int | None
-
-
-def _is_private(ip: str | None) -> bool:
-    if ip is None:
-        return False
-    parsed = ipaddress.ip_address(ip)
-    return any(parsed in network for network in PRIVATE_NETS)
+    tcp_window: int | None = None
+    ip_more_fragments: bool | None = None
+    ip_frag_offset: int | None = None
 
 
 def _flow_key(src_ip: str, dst_ip: str, src_port: int, dst_port: int, proto: str) -> str:
@@ -114,16 +109,6 @@ def _flow_key(src_ip: str, dst_ip: str, src_port: int, dst_port: int, proto: str
     else:
         a, b = right, left
     return f"{proto}|{a[0]}:{a[1]}|{b[0]}:{b[1]}"
-
-
-def _extract_printable(payload: bytes, max_chars: int = 200) -> str | None:
-    if not payload:
-        return None
-    cleaned = payload[:max_chars]
-    text = "".join(chr(b) if 32 <= b <= 126 else "." for b in cleaned)
-    if not text.strip("."):
-        return None
-    return text
 
 
 def _extract_icmp_hidden_text(frame: bytes, icmp_start: int) -> str | None:
@@ -228,18 +213,6 @@ def _tcp_flags(flags_byte: int) -> list[str]:
     return [name for bit, name in mapping if flags_byte & bit]
 
 
-def _entropy(data: bytes) -> float:
-    if not data:
-        return 0.0
-    counts = collections.Counter(data)
-    total = len(data)
-    value = 0.0
-    for count in counts.values():
-        p = count / total
-        value -= p * math.log2(p)
-    return value
-
-
 def _packet_indicators(
     src_ip: str | None,
     dst_ip: str | None,
@@ -255,7 +228,7 @@ def _packet_indicators(
 
     if direction in {"ingress", "egress", "external"} and (src_port in SUSPICIOUS_PORTS or dst_port in SUSPICIOUS_PORTS):
         indicators.append("suspicious_port")
-    if src_ip and dst_ip and (_is_private(src_ip) != _is_private(dst_ip)):
+    if src_ip and dst_ip and (is_private_ip(src_ip) != is_private_ip(dst_ip)):
         indicators.append("cross_boundary_traffic")
     if "SYN" in tcp_flag_names and "ACK" not in tcp_flag_names:
         indicators.append("tcp_syn")
@@ -272,45 +245,76 @@ def _packet_indicators(
         indicators.append("http_server_error")
 
     if payload:
-        entropy = _entropy(payload[:256])
-        if entropy > 7.4 and len(payload) > 80:
+        payload_entropy = entropy(payload[:256])
+        if payload_entropy > 7.4 and len(payload) > 80:
             indicators.append("high_entropy_payload")
 
     return indicators
 
 
 def _read_pcap(path: Path) -> tuple[list[tuple[int, int, bytes, int]], str, int]:
-    with path.open("rb") as handle:
-        magic = handle.read(4)
-        if magic == b"\xd4\xc3\xb2\xa1":
-            endian = "<"
-        elif magic == b"\xa1\xb2\xc3\xd4":
-            endian = ">"
-        elif magic == b"\x0a\x0d\x0d\x0a":
-            raise ValueError("pcapng is not supported. Convert to pcap first, for example: editcap input.pcapng output.pcap")
-        else:
-            raise ValueError(f"Unsupported pcap magic bytes: {magic.hex()}")
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = os.lseek(fd, 0, os.SEEK_END)
+        if size == 0:
+            raise ValueError("Empty pcap file")
+        os.lseek(fd, 0, os.SEEK_SET)
+        with mmap.mmap(fd, size, access=mmap.ACCESS_READ) as mem:
+            magic = mem[:4]
+            if magic == b"\xd4\xc3\xb2\xa1":
+                endian = "<"
+            elif magic == b"\xa1\xb2\xc3\xd4":
+                endian = ">"
+            elif magic == b"\x0a\x0d\x0d\x0a":
+                try:
+                    return parse_pcapng(path)
+                except (ValueError, OSError):
+                    return _try_convert_pcapng(path)
+            else:
+                raise ValueError(f"Unsupported pcap magic bytes: {magic.hex()}")
 
-        header = handle.read(20)
-        if len(header) != 20:
-            raise ValueError("Corrupted pcap global header")
+            if len(mem) < 24:
+                raise ValueError("Corrupted pcap global header")
 
-        _, _, _, _, _, link_type = struct.unpack(endian + "HHiIII", header)
+            _, _, _, _, _, link_type = struct.unpack(endian + "HHiIII", mem[4:24])
 
-        packets: list[tuple[int, int, bytes, int]] = []
-        while True:
-            packet_header = handle.read(16)
-            if not packet_header:
-                break
-            if len(packet_header) < 16:
-                raise ValueError("Corrupted pcap packet header")
+            packets: list[tuple[int, int, bytes, int]] = []
+            offset = 24
+            while offset + 16 <= len(mem):
+                ts_sec, ts_usec, captured_len, original_len = struct.unpack(endian + "IIII", mem[offset : offset + 16])
+                offset += 16
+                if offset + captured_len > len(mem):
+                    raise ValueError("Corrupted pcap packet payload")
+                payload = bytes(mem[offset : offset + captured_len])
+                offset += captured_len
+                packets.append((ts_sec, ts_usec, payload, original_len))
+            return packets, endian, link_type
+    finally:
+        os.close(fd)
 
-            ts_sec, ts_usec, captured_len, original_len = struct.unpack(endian + "IIII", packet_header)
-            payload = handle.read(captured_len)
-            if len(payload) != captured_len:
-                raise ValueError("Corrupted pcap packet payload")
-            packets.append((ts_sec, ts_usec, payload, original_len))
-    return packets, endian, link_type
+
+def _try_convert_pcapng(path: Path) -> tuple[list[tuple[int, int, bytes, int]], str, int]:
+    for tool in ("editcap", "tshark"):
+        exe = shutil.which(tool)
+        if exe is None:
+            continue
+        tmp = Path(tempfile.mktemp(suffix=".pcap"))
+        try:
+            if tool == "editcap":
+                cmd = [exe, str(path), str(tmp)]
+            else:
+                cmd = [exe, "-F", "pcap", "-r", str(path), str(tmp)]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+            return _read_pcap(tmp)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            tmp.unlink(missing_ok=True)
+            continue
+        finally:
+            tmp.unlink(missing_ok=True)
+    raise ValueError(
+        "pcapng is not supported. Install Wireshark (editcap/tshark) for auto-conversion, "
+        "or convert manually: editcap input.pcapng output.pcap"
+    )
 
 
 def _extract_l3_context(frame: bytes, link_type: int) -> tuple[str, int | None, int | None]:
@@ -380,20 +384,319 @@ def _extract_l3_context(frame: bytes, link_type: int) -> tuple[str, int | None, 
     return f"linktype_{link_type}", None, None
 
 
-def analyze_pcap(
-    pcap_path: str | Path,
-    *,
-    max_packets: int | None = None,
-    include_payload_b64: bool = True,
-    max_payload_b64_bytes: int = 256,
-    packet_output_limit: int | None = 5000,
-) -> dict[str, Any]:
-    path = Path(pcap_path)
-    packets_raw, endian, link_type = _read_pcap(path)
-    if max_packets is not None:
-        packets_raw = packets_raw[:max_packets]
+def _parse_tls(payload: bytes) -> dict[str, Any]:
+    """Parse first TLS record from *payload* and extract metadata."""
+    result: dict[str, Any] = {
+        "tls_content_type": None,
+        "tls_version": None,
+        "has_sni": False,
+        "is_heartbleed": False,
+    }
+    if len(payload) < 5:
+        return result
 
+    content_type = payload[0]
+    version_bytes = payload[1:3]
+    record_len = struct.unpack(">H", payload[3:5])[0]
+
+    version_map = {
+        b"\x03\x00": "0x0300",
+        b"\x03\x01": "0x0301",
+        b"\x03\x02": "0x0302",
+        b"\x03\x03": "0x0303",
+        b"\x03\x04": "0x0304",
+    }
+    tls_ver = version_map.get(version_bytes)
+    result["tls_version"] = tls_ver
+
+    if content_type == 0x15:  # Alert
+        result["tls_content_type"] = "TLS Alert"
+    elif content_type == 0x16:  # Handshake
+        if len(payload) < 6:
+            return result
+        hs_type = payload[5]
+        if hs_type == 0x01:  # ClientHello
+            result["tls_content_type"] = "TLS ClientHello"
+            _parse_clienthello_sni(payload, result)
+        elif hs_type == 0x02:  # ServerHello
+            result["tls_content_type"] = "TLS ServerHello"
+        elif hs_type == 0x0B:  # Certificate
+            result["tls_content_type"] = "TLS Certificate"
+        elif hs_type == 0x10:  # CertificateRequest
+            result["tls_content_type"] = "TLS CertificateRequest"
+        else:
+            result["tls_content_type"] = f"TLS Handshake({hs_type})"
+    elif content_type == 0x17:  # Application Data
+        result["tls_content_type"] = "TLS AppData"
+    elif content_type == 0x18:  # Heartbeat
+        result["tls_content_type"] = "HEARTBLEED REQUEST"
+        # Heartbleed: heartbeat request where payload_length > actual payload
+        # TLS record header (5) + HeartbeatMessageType (1) + payload_length (2) = 8 bytes min
+        if len(payload) >= 8:
+            hb_payload_len = struct.unpack(">H", payload[6:8])[0]
+            available = len(payload) - 8
+            if hb_payload_len > available + 16:
+                result["is_heartbleed"] = True
+
+    return result
+
+
+def _parse_clienthello_sni(payload: bytes, result: dict[str, Any]) -> None:
+    """Extract SNI from TLS ClientHello handshake record, if present."""
+    if len(payload) < 43:
+        return
+    # Skip: record header(5) + hs_type(1) + hs_len(3) + version(2) + random(32) = 43
+    offset = 43
+    # Skip session_id (1 byte length + data)
+    if offset >= len(payload):
+        return
+    session_id_len = payload[offset]
+    offset += 1 + session_id_len
+    # Skip cipher suites (2 byte length + data)
+    if offset + 1 >= len(payload):
+        return
+    cs_len = struct.unpack(">H", payload[offset : offset + 2])[0]
+    offset += 2 + cs_len
+    # Skip compression methods (1 byte length + data)
+    if offset >= len(payload):
+        return
+    comp_len = payload[offset]
+    offset += 1 + comp_len
+    # Extensions: 2 byte length + data
+    if offset + 1 >= len(payload):
+        return
+    ext_total = struct.unpack(">H", payload[offset : offset + 2])[0]
+    offset += 2
+    ext_end = offset + ext_total
+    while offset + 4 <= ext_end and offset + 4 <= len(payload):
+        ext_type = struct.unpack(">H", payload[offset : offset + 2])[0]
+        ext_len = struct.unpack(">H", payload[offset + 2 : offset + 4])[0]
+        offset += 4
+        if ext_type == 0x0000:  # SNI
+            if len(payload) >= offset + ext_len:
+                sni_data = payload[offset : offset + ext_len]
+                if len(sni_data) > 5:
+                    name_len = struct.unpack(">H", sni_data[3:5])[0]
+                    if len(sni_data) >= 5 + name_len:
+                        result["has_sni"] = True
+            break
+        offset += ext_len
+
+
+def _parse_dns_txt_length(payload: bytes) -> int | None:
+    """Parse DNS response answer section and return first TXT record length."""
+    if len(payload) < 12:
+        return None
+    # Check QR bit (response)
+    if not (payload[2] & 0x80):
+        return None
+    # Parse header counts
+    qdcount = struct.unpack(">H", payload[4:6])[0]
+    ancount = struct.unpack(">H", payload[6:8])[0]
+    if ancount < 1 or qdcount < 1:
+        return None
+    # Skip question section
+    offset = 12
+    for _ in range(qdcount):
+        while offset < len(payload):
+            label_len = payload[offset]
+            if label_len == 0:
+                offset += 1
+                break
+            if label_len & 0xC0:
+                offset += 2
+                break
+            offset += 1 + label_len
+        offset += 4  # QTYPE + QCLASS
+    # Parse answer records
+    for _ in range(ancount):
+        if offset >= len(payload):
+            break
+        # Name (might be compressed pointer 2 bytes)
+        name_start = offset
+        if payload[offset] & 0xC0:
+            offset += 2
+        else:
+            while offset < len(payload):
+                label_len = payload[offset]
+                if label_len == 0:
+                    offset += 1
+                    break
+                if label_len & 0xC0:
+                    offset += 2
+                    break
+                offset += 1 + label_len
+        # TYPE, CLASS, TTL, RDLENGTH
+        if offset + 10 > len(payload):
+            break
+        rrtype = struct.unpack(">H", payload[offset : offset + 2])[0]
+        offset += 2
+        offset += 2  # CLASS
+        offset += 4  # TTL
+        rdlength = struct.unpack(">H", payload[offset : offset + 2])[0]
+        offset += 2
+        if rrtype == 16:  # TXT
+            return rdlength
+        offset += rdlength
+    return None
+
+
+def _build_detection_dict(
+    index: int,
+    timestamp: float,
+    src_ip: str | None,
+    dst_ip: str | None,
+    src_port: int | None,
+    dst_port: int | None,
+    l4: str | None,
+    l3: str | None,
+    app_hints: list[str],
+    ttl: int | None,
+    tcp_flag_names: list[str],
+    tcp_window_val: int | None,
+    payload: bytes,
+    captured_len: int,
+    http_first_line: str | None,
+    dns_query_val: str | None,
+    icmp_type_val: int | None,
+    icmp_code_val: int | None,
+    icmp_id_val: int | None,
+    icmp_seq_val: int | None,
+    ip_mf: bool | None,
+    ip_fo: int | None,
+    icmp_hidden_map: dict[int, str],
+    double_vlan_val: bool = False,
+) -> DetectionPacket:
+    proto: str
+    content_type: str | None = None
+    readable: str | None = None
+    tls_version: str | None = None
+    dns_txt_length_val: int | None = None
+
+    if "http" in app_hints:
+        proto = "HTTP"
+        content_type = "HTTP response" if (http_first_line or "").startswith("HTTP/") else "HTTP request" if http_first_line else None
+        readable = decode_payload_text(payload)
+    elif "dns" in app_hints:
+        proto = "DNS"
+        is_dns_response = bool(payload[2] & 0x80) if len(payload) > 2 else False
+        content_type = "DNS Response" if is_dns_response else "DNS Query"
+        readable = f"Query: {dns_query_val}" if dns_query_val else None
+        dns_txt_length_val = _parse_dns_txt_length(payload) if is_dns_response else None
+    elif l4 == "tcp":
+        if src_port == 443 or dst_port == 443:
+            proto = "TLS"
+            readable = decode_payload_text(payload)
+            tls_info = _parse_tls(payload)
+            content_type = tls_info.get("tls_content_type")
+            tls_version = tls_info.get("tls_version")
+            if tls_info.get("is_heartbleed"):
+                content_type = "HEARTBLEED REQUEST"
+        else:
+            proto = "TCP"
+            if payload:
+                text = decode_payload_text(payload)
+                pr = printable_ratio(payload[:256])
+                readable = text[:300] if pr > 0.5 else None
+    elif l4 == "udp":
+        proto = "UDP"
+    elif l4 == "icmp":
+        proto = "ICMP"
+        if icmp_type_val == 8:
+            content_type = "Echo Request"
+        elif icmp_type_val == 0:
+            content_type = "Echo Reply"
+        else:
+            content_type = "ICMP"
+    elif l4 == "icmpv6":
+        proto = "ICMPv6"
+        if icmp_type_val == 128:
+            content_type = "Echo Request"
+        elif icmp_type_val == 129:
+            content_type = "Echo Reply"
+        else:
+            content_type = "ICMPv6"
+    elif l3 == "arp":
+        proto = "ARP"
+        readable = decode_payload_text(payload)
+    else:
+        proto = (l4 or "UNKNOWN").upper()
+        readable = decode_payload_text(payload)[:300] if payload else None
+
+    hidden_message = (icmp_seq_val is not None and icmp_seq_val in icmp_hidden_map)
+
+    return {
+        "index": index,
+        "timestamp": timestamp,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "src_port": src_port,
+        "dst_port": dst_port,
+        "protocol": proto,
+        "length": captured_len,
+        "ttl": ttl,
+        "tcp_flags": tcp_flag_names,
+        "tcp_window": tcp_window_val,
+        "content_type": content_type,
+        "readable": readable,
+        "hidden_message": hidden_message,
+        "icmp_id": icmp_id_val,
+        "icmp_seq": icmp_seq_val,
+        "icmp_type": icmp_type_val,
+        "icmp_code": icmp_code_val,
+        "ip_more_fragments": ip_mf,
+        "ip_frag_offset": ip_fo,
+        "tls_version": tls_version,
+        "dns_txt_length": dns_txt_length_val,
+        "double_vlan": double_vlan_val,
+    }
+
+
+def _flow_to_conversation_dict(flow: dict[str, Any]) -> dict[str, Any]:
+    proto = flow.get("protocol", "tcp")
+    app = flow.get("app_hints", [])
+    if "http" in app:
+        app_proto = "HTTP"
+    elif "dns" in app:
+        app_proto = "DNS"
+    elif proto == "tcp":
+        app_proto = "TCP"
+    elif proto == "udp":
+        app_proto = "UDP"
+    else:
+        app_proto = proto.upper()
+
+    src = flow.get("src", "")
+    dst = flow.get("dst", "")
+
+    return {
+        "id": flow.get("flow_key", ""),
+        "protocol": app_proto,
+        "client": src,
+        "server": dst,
+        "start_time": flow.get("first_seen", 0.0),
+        "end_time": flow.get("last_seen", 0.0),
+        "duration_sec": flow.get("duration_sec", 0.0),
+        "total_packets": flow.get("packets", 0),
+        "total_bytes": flow.get("bytes", 0),
+        "bytes_a_to_b": flow.get("bytes_a_to_b", 0),
+        "bytes_b_to_a": flow.get("bytes_b_to_a", 0),
+        "stream": [],
+        "tcp_flags": list(flow.get("tcp_flags", [])),
+    }
+
+
+def _process_packet_chunk(
+    packets_chunk: list[tuple[int, int, bytes, int]],
+    start_index: int,
+    link_type: int,
+    endian: str,
+    include_payload_b64: bool,
+    max_payload_b64_bytes: int,
+) -> dict[str, Any]:
+    """Process a chunk of raw packets. Returns dict with all collected data."""
     packet_records: list[PacketRecord] = []
+    detection_packets: list[DetectionPacket] = []
     protocol_counts: collections.Counter[str] = collections.Counter()
     source_ip_counts: collections.Counter[str] = collections.Counter()
     destination_ip_counts: collections.Counter[str] = collections.Counter()
@@ -406,41 +709,39 @@ def analyze_pcap(
     payload_bytes_total = 0
     icmp_hidden_texts: dict[int, str] = {}
 
-    if packets_raw:
-        start_ts = packets_raw[0][0] + packets_raw[0][1] / 1_000_000
-        end_ts = packets_raw[-1][0] + packets_raw[-1][1] / 1_000_000
-    else:
-        start_ts = 0.0
-        end_ts = 0.0
-
-    for index, (ts_sec, ts_usec, frame, original_len) in enumerate(packets_raw, start=1):
+    for index, (ts_sec, ts_usec, frame, original_len) in enumerate(packets_chunk, start=start_index):
         timestamp = ts_sec + ts_usec / 1_000_000
-        l2 = "unknown"
-        l3 = None
-        l4 = None
-        src_ip = None
-        dst_ip = None
-        src_port = None
-        dst_port = None
-        ttl = None
-        payload = b""
-        dns_query = None
-        http_first_line = None
+        l2: str = "unknown"
+        l3: str | None = None
+        l4: str | None = None
+        src_ip: str | None = None
+        dst_ip: str | None = None
+        src_port: int | None = None
+        dst_port: int | None = None
+        ttl: int | None = None
+        payload: bytes = b""
+        dns_query: str | None = None
+        http_first_line: str | None = None
         tcp_flag_names: list[str] = []
         app_hints: list[str] = []
-        flow_key = None
-        parse_note = None
-        icmp_type = None
-        icmp_code = None
-        icmp_checksum = None
-        icmp_id = None
-        icmp_seq = None
+        flow_key: str | None = None
+        parse_note: str | None = None
+        icmp_type: int | None = None
+        icmp_code: int | None = None
+        icmp_checksum: int | None = None
+        icmp_id: int | None = None
+        icmp_seq: int | None = None
+        tcp_window: int | None = None
+        ip_more_fragments: bool | None = None
+        ip_frag_offset: int | None = None
 
         l2, l3_offset, eth_type = _extract_l3_context(frame, link_type)
+        vlan_count = 0
         if l3_offset is not None and eth_type is not None:
             while eth_type in {ETH_TYPE_VLAN_8021Q, ETH_TYPE_VLAN_8021AD} and len(frame) >= l3_offset + 4:
                 eth_type = struct.unpack(">H", frame[l3_offset + 2 : l3_offset + 4])[0]
                 l3_offset += 4
+                vlan_count += 1
 
             if eth_type == ETH_TYPE_ARP:
                 protocol_counts["ARP"] += 1
@@ -461,6 +762,9 @@ def analyze_pcap(
                         dst_ip = ".".join(str(b) for b in frame[ip_header_start + 16 : ip_header_start + 20])
                         source_ip_counts[src_ip] += 1
                         destination_ip_counts[dst_ip] += 1
+                        flags_offset_val = struct.unpack(">H", frame[ip_header_start + 6 : ip_header_start + 8])[0]
+                        ip_more_fragments = bool(flags_offset_val & 0x2000)
+                        ip_frag_offset = flags_offset_val & 0x1FFF
 
                         if proto == PROTO_ICMP:
                             l4 = "icmp"
@@ -488,6 +792,7 @@ def analyze_pcap(
                                 data_offset = (frame[ip_header_end + 12] >> 4) * 4
                                 flags_byte = frame[ip_header_end + 13]
                                 tcp_flag_names = _tcp_flags(flags_byte)
+                                tcp_window = struct.unpack(">H", frame[ip_header_end + 14 : ip_header_end + 16])[0]
                                 payload_start = ip_header_end + data_offset
                                 payload = frame[payload_start:] if len(frame) >= payload_start else b""
                                 if src_port is not None:
@@ -498,6 +803,15 @@ def analyze_pcap(
                                 if http_first_line:
                                     app_hints.append("http")
                                     http_lines.append(http_first_line)
+                                if src_port == 22 or dst_port == 22:
+                                    if detect_ssh(payload).get("app_hint"):
+                                        app_hints.append("ssh")
+                                elif src_port in {139, 445} or dst_port in {139, 445}:
+                                    if detect_smb(payload).get("app_hint"):
+                                        app_hints.append("smb")
+                                elif src_port == 88 or dst_port == 88:
+                                    if detect_kerberos(payload).get("app_hint"):
+                                        app_hints.append("kerberos")
                         elif proto == PROTO_UDP:
                             l4 = "udp"
                             protocol_counts["UDP"] += 1
@@ -514,6 +828,12 @@ def analyze_pcap(
                                     if dns_query:
                                         app_hints.append("dns")
                                         dns_queries[dns_query] += 1
+                                elif src_port == 88 or dst_port == 88:
+                                    if detect_kerberos(payload).get("app_hint"):
+                                        app_hints.append("kerberos")
+                                elif src_port == 443 or dst_port == 443:
+                                    if detect_quic(payload).get("app_hint"):
+                                        app_hints.append("quic")
                         else:
                             l4 = f"ip_proto_{proto}"
                             protocol_counts[l4] += 1
@@ -548,6 +868,15 @@ def analyze_pcap(
                             if http_first_line:
                                 app_hints.append("http")
                                 http_lines.append(http_first_line)
+                            if src_port == 22 or dst_port == 22:
+                                if detect_ssh(payload).get("app_hint"):
+                                    app_hints.append("ssh")
+                            elif src_port in {139, 445} or dst_port in {139, 445}:
+                                if detect_smb(payload).get("app_hint"):
+                                    app_hints.append("smb")
+                            elif src_port == 88 or dst_port == 88:
+                                if detect_kerberos(payload).get("app_hint"):
+                                    app_hints.append("kerberos")
                     elif proto == PROTO_UDP:
                         l4 = "udp"
                         protocol_counts["UDP"] += 1
@@ -562,6 +891,12 @@ def analyze_pcap(
                                 if dns_query:
                                     app_hints.append("dns")
                                     dns_queries[dns_query] += 1
+                            elif src_port == 88 or dst_port == 88:
+                                if detect_kerberos(payload).get("app_hint"):
+                                    app_hints.append("kerberos")
+                            elif src_port == 443 or dst_port == 443:
+                                if detect_quic(payload).get("app_hint"):
+                                    app_hints.append("quic")
                     elif proto == 58:
                         l4 = "icmpv6"
                         protocol_counts["ICMPv6"] += 1
@@ -620,8 +955,8 @@ def analyze_pcap(
 
         direction = None
         if src_ip and dst_ip:
-            src_private = _is_private(src_ip)
-            dst_private = _is_private(dst_ip)
+            src_private = is_private_ip(src_ip)
+            dst_private = is_private_ip(dst_ip)
             if src_private and not dst_private:
                 direction = "egress"
             elif not src_private and dst_private:
@@ -631,7 +966,7 @@ def analyze_pcap(
             else:
                 direction = "external"
 
-        payload_preview = _extract_printable(payload)
+        payload_preview = extract_printable(payload)
         payload_b64 = _b64(payload, max_payload_b64_bytes) if include_payload_b64 else None
         payload_hex = _hex(payload, max_payload_b64_bytes)
         indicators = _packet_indicators(
@@ -690,8 +1025,153 @@ def analyze_pcap(
                 icmp_checksum=icmp_checksum,
                 icmp_id=icmp_id,
                 icmp_seq=icmp_seq,
+                tcp_window=tcp_window,
+                ip_more_fragments=ip_more_fragments,
+                ip_frag_offset=ip_frag_offset,
             )
         )
+
+        double_vlan = vlan_count >= 2
+        detection_packets.append(
+            _build_detection_dict(
+                index=index,
+                timestamp=timestamp,
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                src_port=src_port,
+                dst_port=dst_port,
+                l4=l4,
+                l3=l3,
+                app_hints=app_hints,
+                ttl=ttl,
+                tcp_flag_names=tcp_flag_names,
+                tcp_window_val=tcp_window,
+                payload=payload,
+                captured_len=len(frame),
+                http_first_line=http_first_line,
+                dns_query_val=dns_query,
+                icmp_type_val=icmp_type,
+                icmp_code_val=icmp_code,
+                icmp_id_val=icmp_id,
+                icmp_seq_val=icmp_seq,
+                ip_mf=ip_more_fragments,
+                ip_fo=ip_frag_offset,
+                icmp_hidden_map={},
+                double_vlan_val=double_vlan,
+            )
+        )
+
+    return {
+        "packet_records": packet_records,
+        "detection_packets": detection_packets,
+        "protocol_counts": protocol_counts,
+        "source_ip_counts": source_ip_counts,
+        "destination_ip_counts": destination_ip_counts,
+        "tcp_port_counts": tcp_port_counts,
+        "udp_port_counts": udp_port_counts,
+        "flows": flows,
+        "indicator_counts": indicator_counts,
+        "dns_queries": dns_queries,
+        "http_lines": http_lines,
+        "payload_bytes_total": payload_bytes_total,
+        "icmp_hidden_texts": icmp_hidden_texts,
+    }
+
+
+def _merge_chunk_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge results from multiple _process_packet_chunk calls."""
+    merged: dict[str, Any] = {
+        "packet_records": [],
+        "detection_packets": [],
+        "protocol_counts": collections.Counter(),
+        "source_ip_counts": collections.Counter(),
+        "destination_ip_counts": collections.Counter(),
+        "tcp_port_counts": collections.Counter(),
+        "udp_port_counts": collections.Counter(),
+        "flows": {},
+        "indicator_counts": collections.Counter(),
+        "dns_queries": collections.Counter(),
+        "http_lines": [],
+        "payload_bytes_total": 0,
+        "icmp_hidden_texts": {},
+    }
+    for r in results:
+        merged["packet_records"].extend(r["packet_records"])
+        merged["detection_packets"].extend(r["detection_packets"])
+        merged["protocol_counts"] += r["protocol_counts"]
+        merged["source_ip_counts"] += r["source_ip_counts"]
+        merged["destination_ip_counts"] += r["destination_ip_counts"]
+        merged["tcp_port_counts"] += r["tcp_port_counts"]
+        merged["udp_port_counts"] += r["udp_port_counts"]
+        merged["indicator_counts"] += r["indicator_counts"]
+        merged["dns_queries"] += r["dns_queries"]
+        merged["http_lines"].extend(r["http_lines"])
+        merged["payload_bytes_total"] += r["payload_bytes_total"]
+        merged["icmp_hidden_texts"].update(r["icmp_hidden_texts"])
+        # Merge flows
+        for flow_key, flow in r["flows"].items():
+            existing = merged["flows"].get(flow_key)
+            if existing is None:
+                merged["flows"][flow_key] = flow
+            else:
+                existing["first_seen"] = min(existing["first_seen"], flow["first_seen"])
+                existing["last_seen"] = max(existing["last_seen"], flow["last_seen"])
+                existing["packets"] += flow["packets"]
+                existing["bytes"] += flow["bytes"]
+                existing["bytes_a_to_b"] += flow["bytes_a_to_b"]
+                existing["bytes_b_to_a"] += flow["bytes_b_to_a"]
+                existing["tcp_flags"].update(flow["tcp_flags"])
+                existing["app_hints"].update(flow["app_hints"])
+                existing["indicators"] += flow["indicators"]
+    return merged
+
+
+def _build_result(
+    packets_raw: list[tuple[int, int, bytes, int]],
+    endian: str,
+    link_type: int,
+    path: Path,
+    *,
+    include_payload_b64: bool = True,
+    max_payload_b64_bytes: int = 256,
+    packet_output_limit: int | None = 5000,
+) -> dict[str, Any]:
+    """Build full analysis result from raw parsed packet data (shared by file + live)."""
+    # Decide sequential vs parallel
+    if len(packets_raw) < 1000:
+        result = _process_packet_chunk(packets_raw, 1, link_type, endian, include_payload_b64, max_payload_b64_bytes)
+        merged = _merge_chunk_results([result])
+    else:
+        num_workers = min(32, (os.cpu_count() or 1) + 4)
+        chunk_size = max(num_workers * 10, 100)
+        chunks: list[list[tuple[int, int, bytes, int]]] = []
+        for i in range(0, len(packets_raw), chunk_size):
+            chunks.append(packets_raw[i:i + chunk_size])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = []
+            start = 1
+            for chunk in chunks:
+                futures.append(pool.submit(_process_packet_chunk, chunk, start, link_type, endian, include_payload_b64, max_payload_b64_bytes))
+                start += len(chunk)
+            results = [f.result() for f in futures]
+        merged = _merge_chunk_results(results)
+
+    packet_records = merged["packet_records"]
+    detection_packets = merged["detection_packets"]
+    protocol_counts = merged["protocol_counts"]
+    source_ip_counts = merged["source_ip_counts"]
+    destination_ip_counts = merged["destination_ip_counts"]
+    tcp_port_counts = merged["tcp_port_counts"]
+    udp_port_counts = merged["udp_port_counts"]
+    flows = merged["flows"]
+    indicator_counts = merged["indicator_counts"]
+    dns_queries = merged["dns_queries"]
+    http_lines = merged["http_lines"]
+    payload_bytes_total = merged["payload_bytes_total"]
+    icmp_hidden_texts = merged["icmp_hidden_texts"]
+
+    start_ts = packets_raw[0][0] + packets_raw[0][1] / 1_000_000 if packets_raw else 0.0
+    end_ts = packets_raw[-1][0] + packets_raw[-1][1] / 1_000_000 if packets_raw else 0.0
 
     serialized_flows: list[dict[str, Any]] = []
     for flow in flows.values():
@@ -754,7 +1234,7 @@ def analyze_pcap(
         packets_truncated = True
     duration = max(0.0, end_ts - start_ts)
 
-    summary = {
+    summary: dict[str, Any] = {
         "file": str(path),
         "file_name": path.name,
         "packet_count": len(packet_records),
@@ -800,12 +1280,22 @@ def analyze_pcap(
         "icmp_hidden_texts": dict(sorted(icmp_hidden_texts.items())),
     }
 
-    if summary["icmp_hidden_texts"]:
+    # ── Run detection engine ─────────────────────────────────────────────
+    icmp_hidden_map: dict[int, str] = dict(sorted(icmp_hidden_texts.items()))
+    for d in detection_packets:
+        icmp_seq = d.get("icmp_seq")
+        if icmp_seq is not None and icmp_seq in icmp_hidden_map:
+            d["hidden_message"] = True
+    detection_conversations = [_flow_to_conversation_dict(f) for f in serialized_flows]
+    alerts = detections.run_detections(detection_packets, detection_conversations, total_packets=len(packet_records))
+
+    if icmp_hidden_map:
         print("ICMP hidden text:")
-        for seq, text in summary["icmp_hidden_texts"].items():
+        for seq, text in icmp_hidden_map.items():
             print(f"{seq}: {text}")
 
-    ai_prep = {
+    ai_prep: dict[str, Any] = {
+        "alerts": alerts,
         "prompt_guidance": {
             "task": "Analyze this network capture for notable behavior, anomalies, and likely activity.",
             "focus_areas": [
@@ -826,6 +1316,26 @@ def analyze_pcap(
     return ai_prep
 
 
+def analyze_pcap(
+    pcap_path: str | Path,
+    *,
+    max_packets: int | None = None,
+    include_payload_b64: bool = True,
+    max_payload_b64_bytes: int = 256,
+    packet_output_limit: int | None = 5000,
+) -> dict[str, Any]:
+    path = Path(pcap_path)
+    packets_raw, endian, link_type = _read_pcap(path)
+    if max_packets is not None:
+        packets_raw = packets_raw[:max_packets]
+    return _build_result(
+        packets_raw, endian, link_type, path,
+        include_payload_b64=include_payload_b64,
+        max_payload_b64_bytes=max_payload_b64_bytes,
+        packet_output_limit=packet_output_limit,
+    )
+
+
 def render_json(result: dict[str, Any], *, pretty: bool = True) -> str:
     if pretty:
         return json.dumps(result, indent=2, sort_keys=False)
@@ -835,11 +1345,28 @@ def render_json(result: dict[str, Any], *, pretty: bool = True) -> str:
 def render_jsonl(result: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append(json.dumps({"type": "summary", "data": result["summary"]}, separators=(",", ":")))
+    for alert in result.get("alerts", []):
+        lines.append(json.dumps({"type": "alert", "data": alert}, separators=(",", ":")))
     for flow in result["flows"]:
         lines.append(json.dumps({"type": "flow", "data": flow}, separators=(",", ":")))
     for packet in result["packets"]:
         lines.append(json.dumps({"type": "packet", "data": packet}, separators=(",", ":")))
     return "\n".join(lines) + "\n"
+
+
+def stream_jsonl(result: dict[str, Any], output: IO[str]) -> None:
+    """Write JSONL records to *output* as a stream, flushing after each."""
+    output.write(json.dumps({"type": "summary", "data": result["summary"]}, separators=(",", ":")) + "\n")
+    output.flush()
+    for alert in result.get("alerts", []):
+        output.write(json.dumps({"type": "alert", "data": alert}, separators=(",", ":")) + "\n")
+        output.flush()
+    for flow in result["flows"]:
+        output.write(json.dumps({"type": "flow", "data": flow}, separators=(",", ":")) + "\n")
+        output.flush()
+    for packet in result["packets"]:
+        output.write(json.dumps({"type": "packet", "data": packet}, separators=(",", ":")) + "\n")
+        output.flush()
 
 
 def render_ai_prompt(
@@ -868,6 +1395,25 @@ def render_ai_prompt(
     lines.append("Top UDP ports: " + json.dumps(summary.get("top_udp_ports", [])[:10], separators=(",", ":")))
     lines.append("Top DNS queries: " + json.dumps(summary.get("dns_top_queries", [])[:10], separators=(",", ":")))
     lines.append("")
+    alerts = result.get("alerts", [])
+    if alerts:
+        lines.append("=== Alerts ===")
+        for alert in alerts[:20]:
+            lines.append(
+                json.dumps(
+                    {
+                        "rule": alert.get("rule"),
+                        "severity": alert.get("severity"),
+                        "src_ip": alert.get("src_ip"),
+                        "dst_ip": alert.get("dst_ip"),
+                        "description": alert.get("description"),
+                        "count": alert.get("count"),
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        lines.append("")
+
     lines.append("=== Flow Samples ===")
     for flow in flows:
         lines.append(

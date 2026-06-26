@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from packet_analyzer.analyzer import analyze_pcap, render_ai_prompt, render_json, render_jsonl
+from packet_analyzer.analyzer import analyze_pcap, render_ai_prompt, render_json, render_jsonl, stream_jsonl
 
 
 def _run_cli(args: list[str]) -> str:
@@ -614,3 +614,28 @@ def test_wireshark_export_streams_to_file(tmp_path: Path, monkeypatch) -> None:
 
     assert out_file.read_text(encoding="utf-8") == "[{\"_source\":{}}]"
     assert captured["command"] == ["/usr/bin/tshark", "-r", str(pcap), "-T", "json"]
+
+
+def test_stream_jsonl_produces_records(tmp_path: Path) -> None:
+    from io import StringIO
+
+    buf = StringIO()
+    stream_jsonl(
+        {
+            "summary": {"packet_count": 2, "unique_flows": 1, "duration_sec": 1.0, "protocol_counts": {"TCP": 2}},
+            "flows": [{"flow_key": "tcp-10.0.0.1-10.0.0.2", "total_packets": 2}],
+            "packets": [
+                {"index": 0, "protocol": "TCP", "src_ip": "10.0.0.1", "dst_ip": "10.0.0.2"},
+                {"index": 1, "protocol": "TCP", "src_ip": "10.0.0.2", "dst_ip": "10.0.0.1"},
+            ],
+            "alerts": [{"rule": "detect_xss", "severity": "CRITICAL"}],
+        },
+        buf,
+    )
+    output = buf.getvalue()
+    lines = [line for line in output.splitlines() if line.strip()]
+    assert any("summary" in line for line in lines)
+    assert any("flow" in line for line in lines)
+    assert any("packet" in line for line in lines)
+    assert any("alert" in line for line in lines)
+    assert all(line.endswith("}") for line in lines)

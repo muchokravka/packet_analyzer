@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Install dev dependencies
+        run: pip install pytest mypy ruff
+
+      - name: Check with ruff
+        run: ruff check packet_analyzer/
+
+      - name: Check with mypy
+        run: mypy packet_analyzer/ --ignore-missing-imports
+        continue-on-error: true
+
+      - name: Run tests
+        run: pytest tests/ -v
