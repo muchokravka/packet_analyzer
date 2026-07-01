@@ -10,7 +10,9 @@ from typing import Any
 from . import detections
 from .analyzer import analyze_pcap, render_ai_prompt, render_json, render_jsonl, stream_jsonl
 from .compare import compare_pcaps, render_diff_text
+from .detections import build_incident_timelines
 from .formats import render_csv, render_csv_flows
+from .utils import ProgressCallback, add_local_network
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -126,6 +128,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Capture live from a network interface instead of reading a PCAP file",
     )
     parser.add_argument(
+        "--live-engine",
+        choices=("scapy", "tcpdump", "producer-consumer"),
+        default="scapy",
+        help="Capture backend for --live (default: scapy). producer-consumer uses "
+             "a threaded producer-consumer pipeline with streaming sliding-window rules",
+    )
+    parser.add_argument(
+        "--bpf-filter",
+        type=str,
+        default="",
+        help="BPF filter expression for kernel-level filtering (e.g. 'tcp or udp'). "
+             "Packets not matching are dropped at the NIC level before Python touches them.",
+    )
+    parser.add_argument(
         "--list-interfaces",
         action="store_true",
         help="List available network interfaces and exit (requires scapy)",
@@ -147,6 +163,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="Live capture duration in seconds",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress and summary output to stderr/stdout",
+    )
+    parser.add_argument(
+        "--local-net",
+        action="append",
+        default=[],
+        dest="local_nets",
+        help="Additional local network CIDR (repeatable, e.g. --local-net 192.168.63.0/24). "
+             "Traffic within these ranges is classified as internal/lateral.",
     )
     return parser
 
@@ -172,9 +201,44 @@ def _filter_packets(packets: list[dict[str, Any]], *, filter_ip: str | None, fil
     return filtered
 
 
+def _make_progress_callback(quiet: bool) -> ProgressCallback | None:
+    """Return a progress callback if *quiet* is False, else None."""
+    if quiet:
+        return None
+
+    last_stage: list[str] = [""]
+    def _cb(stage: str, current: int | None, total: int | None) -> None:
+        if stage == "reading":
+            if last_stage[0] != "reading":
+                last_stage[0] = "reading"
+                print("[*] Reading PCAP file...", file=sys.stderr)
+        elif stage == "analyzing" and current is not None and total is not None:
+            if last_stage[0] != "analyzing":
+                last_stage[0] = "analyzing"
+                print(f"[*] Analyzing packets: 0/{total} (0%)", file=sys.stderr, end="")
+            pct = current / total * 100 if total > 0 else 0
+            print(f"\r[*] Analyzing packets: {current}/{total} ({pct:.0f}%)", file=sys.stderr, end="")
+            if current == total:
+                print(file=sys.stderr)
+        elif stage == "detections":
+            if last_stage[0] != "detections":
+                last_stage[0] = "detections"
+                print("[*] Running detection rules...", file=sys.stderr)
+        elif stage == "writing":
+            if last_stage[0] != "writing":
+                last_stage[0] = "writing"
+                print("[*] Writing output...", file=sys.stderr)
+    return _cb
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    progress = _make_progress_callback(args.quiet)
+
+    for net in args.local_nets:
+        add_local_network(net)
 
     if args.rules:
         for name in detections.list_rules():
@@ -195,11 +259,13 @@ def main() -> int:
             interface=args.interface,
             count=args.count,
             timeout=args.timeout,
+            engine=args.live_engine,
+            bpf_filter=args.bpf_filter,
             packet_output_limit=args.packet_output_limit,
+            progress=progress,
         )
     elif args.pcap is None:
-        parser.print_usage()
-        print("packet-analyzer: error: the following arguments are required: pcap")
+        parser.print_help()
         return 1
     else:
         result = analyze_pcap(
@@ -208,6 +274,7 @@ def main() -> int:
         include_payload_b64=not args.no_payload_b64,
         max_payload_b64_bytes=args.payload_b64_bytes,
         packet_output_limit=args.packet_output_limit,
+        progress=progress,
     )
 
     # Apply CLI-level filters
@@ -220,6 +287,10 @@ def main() -> int:
     if args.conversations_only:
         result.pop("packets", None)
 
+    # Incident timeline correlation
+    incidents = build_incident_timelines(result.get("alerts", []))
+    result["incident_timelines"] = incidents
+
     # Diff mode
     if args.diff is not None:
         result_b = analyze_pcap(
@@ -228,6 +299,7 @@ def main() -> int:
             include_payload_b64=not args.no_payload_b64,
             max_payload_b64_bytes=args.payload_b64_bytes,
             packet_output_limit=args.packet_output_limit,
+            progress=progress,
         )
         diff = compare_pcaps(result, result_b)
         diff_text = render_diff_text(diff)
@@ -258,6 +330,9 @@ def main() -> int:
         return 0
 
     # Render output
+    if progress:
+        progress("writing", None, None)
+
     if args.format == "jsonl":
         rendered = render_jsonl(result)
     elif args.format == "csv":
@@ -288,9 +363,18 @@ def main() -> int:
             message = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else "tshark failed"
             raise SystemExit(message) from exc
 
+    if args.quiet:
+        return 0
+
     # Print summary to stdout
     alerts = result.get("alerts", [])
     print(detections.render_alerts(alerts))
+
+    incidents = result.get("incident_timelines", [])
+    if incidents:
+        print(f"Incident timelines: {len(incidents)} multi-stage incident(s) detected")
+        for inc in incidents:
+            print(f"  {inc['incident_id']}: {inc['description']}")
 
     summary = result["summary"]
     print(

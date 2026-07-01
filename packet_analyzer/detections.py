@@ -709,7 +709,7 @@ def detect_dns_exfiltration(packets: list[DetectionPacket], conversations: list[
                     protocol="DNS",
                     evidence={"query": query, "subdomain": subdomain, "entropy": sub_entropy},
                     tags=["exfil"],
-                    dedup_key=f"dns_tunnel|{pkt.get('src_ip')}|{query}",
+                    dedup_key=f"dns_tunnel|{pkt.get('src_ip')}|{pkt.get('dst_ip')}",
                 )
             )
     # High-volume detection
@@ -1811,3 +1811,142 @@ def render_alerts(alerts: list[dict[str, Any]]) -> str:
         count = alert.get("count", 1)
         lines.append(f"  [{severity}] {rule} {src} → {dst} (count={count}) {description}")
     return "\n".join(lines)
+
+
+# ── Incident Timeline Correlation ────────────────────────────────────────────
+
+_RECON_RULES = frozenset({
+    "detect_tcp_syn_scan", "detect_tcp_connect_scan", "detect_tcp_flag_scan",
+    "detect_udp_scan", "detect_icmp_sweep", "detect_os_fingerprinting",
+    "detect_service_version_probe",
+})
+
+_EXPLOIT_RULES = frozenset({
+    "detect_heartbleed", "detect_shellshock", "detect_sql_injection",
+    "detect_xss", "detect_log4shell", "detect_smb_exploit",
+    "detect_directory_traversal", "detect_command_injection",
+})
+
+_C2_RULES = frozenset({
+    "detect_beaconing", "detect_dns_tunneling", "detect_dns_exfiltration_volume",
+    "detect_known_bad_ports", "detect_http_c2_user_agent",
+    "detect_http_c2_identical_ua", "detect_tls_no_sni",
+})
+
+_EXFIL_RULES = frozenset({
+    "detect_large_http_post", "detect_icmp_exfiltration",
+    "detect_dns_tunneling", "detect_dns_exfiltration_volume",
+    "detect_private_key_material", "detect_large_dns_txt",
+})
+
+_CREDENTIAL_RULES = frozenset({
+    "detect_http_basic_auth", "detect_http_form_credentials",
+    "detect_ftp_cleartext_credentials", "detect_smtp_auth_cleartext",
+    "detect_session_token_in_url", "detect_telnet_cleartext",
+})
+
+_INCIDENT_WINDOW_SEC = 300  # 5 minutes
+
+
+def build_incident_timelines(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Correlate alerts temporally by source IP and group into incidents.
+
+    An incident is created when a source IP triggers alerts across at least 2
+    different threat stages (recon, exploit, c2, exfil, credential) within
+    *INCIDENT_WINDOW_SEC* seconds.
+
+    Returns a list of incident dicts with keys:
+      incident_id, src_ip, start_time, end_time, duration_sec,
+      stages_observed, total_alerts, alerts (list of matched alerts),
+      kill_chain, description
+    """
+    if not alerts:
+        return []
+
+    by_src: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for alert in alerts:
+        src = alert.get("src_ip")
+        if src:
+            by_src[src].append(alert)
+
+    def _stage(rule: str) -> str | None:
+        if rule in _RECON_RULES:
+            return "recon"
+        if rule in _EXPLOIT_RULES:
+            return "exploit"
+        if rule in _C2_RULES:
+            return "c2"
+        if rule in _EXFIL_RULES:
+            return "exfil"
+        if rule in _CREDENTIAL_RULES:
+            return "credential"
+        return None
+
+    incidents: list[dict[str, Any]] = []
+    incident_counter = 0
+
+    for src_ip, src_alerts in by_src.items():
+        src_alerts.sort(key=lambda a: a.get("timestamp", 0))
+        # Sliding window over sorted alerts
+        window_start = 0
+        while window_start < len(src_alerts):
+            window_end = window_start
+            window_alerts: list[dict[str, Any]] = []
+            while window_end < len(src_alerts):
+                t0 = src_alerts[window_start].get("timestamp", 0)
+                tn = src_alerts[window_end].get("timestamp", 0)
+                if tn - t0 > _INCIDENT_WINDOW_SEC:
+                    break
+                window_alerts.append(src_alerts[window_end])
+                window_end += 1
+
+            if len(window_alerts) >= 2:
+                stages_seen: set[str] = set()
+                for a in window_alerts:
+                    s = _stage(a.get("rule", ""))
+                    if s:
+                        stages_seen.add(s)
+                if len(stages_seen) >= 2:
+                    incident_counter += 1
+                    start_ts = window_alerts[0].get("timestamp", 0)
+                    end_ts = window_alerts[-1].get("timestamp", 0)
+
+                    kill_chain_parts: list[str] = []
+                    for stage in ("recon", "exploit", "credential", "c2", "exfil"):
+                        if stage in stages_seen:
+                            kill_chain_parts.append(stage)
+                    kill_chain = " → ".join(kill_chain_parts)
+
+                    alert_summaries: list[dict[str, Any]] = []
+                    for a in window_alerts:
+                        alert_summaries.append({
+                            "rule": a.get("rule", ""),
+                            "severity": a.get("severity", ""),
+                            "src_ip": a.get("src_ip"),
+                            "dst_ip": a.get("dst_ip"),
+                            "timestamp": a.get("timestamp"),
+                            "description": a.get("description", ""),
+                            "count": a.get("count", 1),
+                        })
+
+                    total = sum(a.get("count", 1) for a in window_alerts)
+                    incidents.append({
+                        "incident_id": f"INC-{incident_counter}",
+                        "src_ip": src_ip,
+                        "start_time": start_ts,
+                        "end_time": end_ts,
+                        "duration_sec": round(end_ts - start_ts, 3),
+                        "stages_observed": sorted(stages_seen),
+                        "total_alerts": total,
+                        "kill_chain": kill_chain,
+                        "description": f"Host {src_ip} exhibits multi-stage activity: {kill_chain} "
+                                       f"({total} alert(s) across {len(stages_seen)} stages in {round(end_ts - start_ts, 1)}s)",
+                        "alerts": alert_summaries,
+                    })
+                    # Slide window past this incident to avoid overlapping
+                    window_start = window_end
+                    continue
+            window_start += 1
+
+    incidents.sort(key=lambda inc: inc.get("start_time", 0))
+    return incidents

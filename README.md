@@ -28,43 +28,116 @@ python -m pip install -e .
 ## Usage
 
 ```bash
+packet-analyzer <pcap_file> [options]
+```
+
+Or run directly from the project root:
+
+```bash
+python3 packet_analyzer.py <pcap_file> [options]
+```
+
+### Basic options
+
+| Flag | Description |
+|------|-------------|
+| `<pcap_file>` | Path to input `.pcap` or `.pcapng` file |
+| `-o, --output <file>` | Output file path (default: `analysis.json`) |
+| `--format <fmt>` | Output format: `json` (default), `jsonl`, or `csv` |
+| `--quiet` | Suppress progress and summary output (for scripting) |
+
+### Analysis scope
+
+| Flag | Description |
+|------|-------------|
+| `--max-packets <n>` | Hard cap on packets to process (no limit by default) |
+| `--packet-output-limit <n>` | Max packet records in output (default: `5000`) |
+| `--compact` | Compact JSON output (no pretty indentation) |
+| `--conversations-only` | Output flow records only, omit per-packet details |
+| `--local-net <cidr>` | Treat CIDR as local network (repeatable, e.g. `--local-net 192.168.63.0/24`) |
+| `--no-payload-b64` | Skip base64 payload excerpts in packet records |
+| `--payload-b64-bytes <n>` | Max payload bytes to base64 per packet (default: `256`) |
+
+### Filtering
+
+| Flag | Description |
+|------|-------------|
+| `--severity <level>` | Min alert severity: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO` |
+| `--filter-ip <ip>` | Only include packets matching this IP (source or destination) |
+| `--filter-proto <proto>` | Only include packets matching protocol (e.g. `HTTP`, `DNS`, `TLS`, `TCP`) |
+| `--rules` | List all available detection rules and exit |
+
+### AI prompt export
+
+| Flag | Description |
+|------|-------------|
+| `--prompt-output <file>` | Write an LLM-ready analysis prompt to a `.txt` file |
+| `--prompt-max-flows <n>` | Max flow records embedded in prompt (default: `20`) |
+| `--prompt-max-packets <n>` | Max packet records embedded in prompt (default: `30`) |
+
+### Diff mode
+
+| Flag | Description |
+|------|-------------|
+| `--diff <pcap_file>` | Compare with a second PCAP file and show differences |
+| `--diff-output <file>` | Write structured diff as JSON to a file |
+
+### Live capture
+
+| Flag | Description |
+|------|-------------|
+| `--live` | Capture live from a network interface instead of reading a file |
+| `--live-engine <engine>` | Capture backend: `scapy` (default) or `tcpdump` |
+| `--interface <name>` | Network interface (e.g. `eth0`, `lo`). Default: system chooses |
+| `--count <n>` | Number of packets to capture (default: `100`, `0` = unlimited) |
+| `--timeout <sec>` | Capture duration in seconds (default: `30`) |
+| `--list-interfaces` | List available network interfaces and exit |
+| `--stream` | Stream JSONL output to stdout while capturing (requires `--format jsonl`) |
+
+### Advanced
+
+| Flag | Description |
+|------|-------------|
+| `--wireshark-export <file>` | Export full Wireshark decode as JSON (requires `tshark`) |
+
+### Examples
+
+Quick analysis:
+```bash
 packet-analyzer capture.pcap -o analysis.json
 ```
 
-JSONL export:
-
+JSONL format:
 ```bash
 packet-analyzer capture.pcap --format jsonl -o analysis.jsonl
 ```
 
-Faster/smaller run for huge captures:
-
+Fast run for huge captures (no payload, compact output):
 ```bash
-packet-analyzer capture.pcap --max-packets 100000 --no-payload-b64 --compact -o analysis.json
+packet-analyzer capture.pcap --max-packets 100000 --no-payload-b64 --compact
 ```
 
-Adjust packet output size for LLM context budget:
-
+LLM workflow with context control:
 ```bash
-packet-analyzer capture.pcap --packet-output-limit 2000 -o analysis.json
+packet-analyzer capture.pcap -o analysis.json \
+  --prompt-output analysis_prompt.txt \
+  --prompt-max-flows 30 \
+  --prompt-max-packets 50
 ```
 
-Generate a ready-to-paste AI prompt file:
-
-```bash
-packet-analyzer capture.pcap -o analysis.json --prompt-output analysis_prompt.txt
-```
-
-Control how much context is embedded in prompt:
-
-```bash
-packet-analyzer capture.pcap -o analysis.json --prompt-output analysis_prompt.txt --prompt-max-flows 30 --prompt-max-packets 50
-```
-
-Export full Wireshark decode (requires tshark):
-
+Wireshark-grade decode (requires tshark):
 ```bash
 packet-analyzer capture.pcap --wireshark-export wireshark.json
+```
+
+Live capture with tcpdump backend:
+```bash
+packet-analyzer --live --live-engine tcpdump --interface eth0 --count 500 -o live.json
+```
+
+Diff two captures:
+```bash
+packet-analyzer capture_before.pcap --diff capture_after.pcap
 ```
 
 ## Output schema highlights

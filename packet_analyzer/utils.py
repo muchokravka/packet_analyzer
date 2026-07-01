@@ -3,9 +3,10 @@ from __future__ import annotations
 import collections
 import ipaddress
 import math
+from collections.abc import Callable
 from typing import Any, NotRequired, TypedDict
 
-_PRIVATE_NETS = [
+_PRIVATE_NETS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
@@ -22,6 +23,15 @@ def is_private_ip(ip: str | None) -> bool:
     except ValueError:
         return False
     return any(parsed in network for network in _PRIVATE_NETS)
+
+
+def add_local_network(cidr: str) -> None:
+    """Register an additional local (trusted) network CIDR for direction classification.
+
+    Call this before analyze_pcap() to treat the given range as internal/private.
+    Example: add_local_network("192.168.63.0/24")
+    """
+    _PRIVATE_NETS.append(ipaddress.ip_network(cidr))
 
 
 def contains_private_ip(text: str) -> bool:
@@ -117,6 +127,8 @@ SUSPICIOUS_PORTS = {
     6667,
     31337,
 }
+
+ProgressCallback = Callable[[str, int | None, int | None], None]
 
 BAD_C2_PORTS = {1080, 4444, 6666, 6667, 6668, 6669, 8888, 9001, 31337}
 

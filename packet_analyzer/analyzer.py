@@ -21,6 +21,7 @@ from .pcapng import parse_pcapng
 from .protocols import detect_kerberos, detect_quic, detect_smb, detect_ssh
 from .utils import (
     DetectionPacket,
+    ProgressCallback,
     decode_payload_text,
     entropy,
     extract_printable,
@@ -1135,25 +1136,45 @@ def _build_result(
     include_payload_b64: bool = True,
     max_payload_b64_bytes: int = 256,
     packet_output_limit: int | None = 5000,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Build full analysis result from raw parsed packet data (shared by file + live)."""
+    total_packets = len(packets_raw)
     # Decide sequential vs parallel
-    if len(packets_raw) < 1000:
+    if total_packets < 1000:
+        if progress:
+            progress("analyzing", 0, total_packets)
         result = _process_packet_chunk(packets_raw, 1, link_type, endian, include_payload_b64, max_payload_b64_bytes)
         merged = _merge_chunk_results([result])
+        if progress:
+            progress("analyzing", total_packets, total_packets)
     else:
         num_workers = min(32, (os.cpu_count() or 1) + 4)
         chunk_size = max(num_workers * 10, 100)
         chunks: list[list[tuple[int, int, bytes, int]]] = []
-        for i in range(0, len(packets_raw), chunk_size):
+        for i in range(0, total_packets, chunk_size):
             chunks.append(packets_raw[i:i + chunk_size])
+
+        if progress:
+            progress("analyzing", 0, total_packets)
+
+        completed = 0
+        results: list[dict[str, Any]] = [{} for _ in range(len(chunks))]
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
-            futures = []
+            futures: dict[concurrent.futures.Future, int] = {}
             start = 1
-            for chunk in chunks:
-                futures.append(pool.submit(_process_packet_chunk, chunk, start, link_type, endian, include_payload_b64, max_payload_b64_bytes))
+            for idx, chunk in enumerate(chunks):
+                future = pool.submit(_process_packet_chunk, chunk, start, link_type, endian, include_payload_b64, max_payload_b64_bytes)
+                futures[future] = idx
                 start += len(chunk)
-            results = [f.result() for f in futures]
+
+            for future in concurrent.futures.as_completed(futures):
+                idx = futures[future]
+                results[idx] = future.result()
+                completed += len(chunks[idx])
+                if progress:
+                    progress("analyzing", min(completed, total_packets), total_packets)
+
         merged = _merge_chunk_results(results)
 
     packet_records = merged["packet_records"]
@@ -1281,6 +1302,8 @@ def _build_result(
     }
 
     # ── Run detection engine ─────────────────────────────────────────────
+    if progress:
+        progress("detections", None, None)
     icmp_hidden_map: dict[int, str] = dict(sorted(icmp_hidden_texts.items()))
     for d in detection_packets:
         icmp_seq = d.get("icmp_seq")
@@ -1323,16 +1346,22 @@ def analyze_pcap(
     include_payload_b64: bool = True,
     max_payload_b64_bytes: int = 256,
     packet_output_limit: int | None = 5000,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     path = Path(pcap_path)
+    if progress:
+        progress("reading", None, None)
     packets_raw, endian, link_type = _read_pcap(path)
     if max_packets is not None:
         packets_raw = packets_raw[:max_packets]
+        if progress:
+            progress("reading", len(packets_raw), len(packets_raw))
     return _build_result(
         packets_raw, endian, link_type, path,
         include_payload_b64=include_payload_b64,
         max_payload_b64_bytes=max_payload_b64_bytes,
         packet_output_limit=packet_output_limit,
+        progress=progress,
     )
 
 

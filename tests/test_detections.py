@@ -792,3 +792,105 @@ def test_detect_quic_traffic_not_udp() -> None:
 def test_detect_quic_traffic_no_match() -> None:
     pkt = _pkt(protocol="UDP", dst_port=53, readable="DNS query")
     assert detections.detect_quic_traffic([pkt], []) == []
+
+
+# ── Incident Timeline Tests ──────────────────────────────────────────────────
+
+
+def _alert(
+    rule: str,
+    src_ip: str = "10.0.0.1",
+    dst_ip: str = "10.0.0.2",
+    severity: str = "HIGH",
+    timestamp: float = 0,
+    count: int = 1,
+    description: str = "",
+) -> dict[str, Any]:
+    return {
+        "rule": rule,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "severity": severity,
+        "timestamp": timestamp,
+        "count": count,
+        "description": description,
+    }
+
+
+class TestBuildIncidentTimelines:
+    def test_empty_alerts(self) -> None:
+        assert detections.build_incident_timelines([]) == []
+
+    def test_single_alert_no_incident(self) -> None:
+        alerts = [_alert("detect_tcp_syn_scan", timestamp=0)]
+        assert detections.build_incident_timelines(alerts) == []
+
+    def test_same_stage_no_incident(self) -> None:
+        # Both recon — need 2 different stages
+        alerts = [
+            _alert("detect_tcp_syn_scan", timestamp=0),
+            _alert("detect_udp_scan", timestamp=5),
+        ]
+        assert detections.build_incident_timelines(alerts) == []
+
+    def test_two_stages_creates_incident(self) -> None:
+        alerts = [
+            _alert("detect_tcp_syn_scan", timestamp=0, description="SYN scan"),
+            _alert("detect_heartbleed", timestamp=10, dst_ip="10.0.0.3",
+                   description="Heartbleed"),
+        ]
+        incidents = detections.build_incident_timelines(alerts)
+        assert len(incidents) == 1
+        inc = incidents[0]
+        assert inc["incident_id"] == "INC-1"
+        assert inc["src_ip"] == "10.0.0.1"
+        assert set(inc["stages_observed"]) == {"recon", "exploit"}
+        assert "recon → exploit" in inc["kill_chain"]
+        assert inc["total_alerts"] == 2
+
+    def test_multi_source_separate_incidents(self) -> None:
+        alerts = [
+            _alert("detect_tcp_syn_scan", src_ip="10.0.0.1", timestamp=0),
+            _alert("detect_heartbleed", src_ip="10.0.0.1", timestamp=5,
+                   dst_ip="10.0.0.5"),
+            _alert("detect_tcp_syn_scan", src_ip="10.0.0.2", timestamp=10),
+            _alert("detect_large_http_post", src_ip="10.0.0.2", timestamp=12,
+                   dst_ip="10.0.0.6"),
+        ]
+        incidents = detections.build_incident_timelines(alerts)
+        assert len(incidents) == 2
+        assert incidents[0]["src_ip"] == "10.0.0.1"
+        assert incidents[1]["src_ip"] == "10.0.0.2"
+
+    def test_beyond_time_window_no_incident(self) -> None:
+        alerts = [
+            _alert("detect_tcp_syn_scan", timestamp=0),
+            _alert("detect_heartbleed", timestamp=301, dst_ip="10.0.0.3"),
+        ]
+        assert detections.build_incident_timelines(alerts) == []
+
+    def test_three_stage_kill_chain(self) -> None:
+        alerts = [
+            _alert("detect_tcp_syn_scan", timestamp=0, description="Scan"),
+            _alert("detect_sql_injection", timestamp=10, dst_ip="10.0.0.3",
+                   description="Exploit"),
+            _alert("detect_dns_tunneling", timestamp=20, dst_ip="10.0.0.4",
+                   description="Tunnel"),
+        ]
+        incidents = detections.build_incident_timelines(alerts)
+        assert len(incidents) == 1
+        assert "recon" in incidents[0]["stages_observed"]
+        assert "exploit" in incidents[0]["stages_observed"]
+        assert "c2" in incidents[0]["stages_observed"]
+
+    def test_incident_contains_alert_details(self) -> None:
+        alerts = [
+            _alert("detect_tcp_syn_scan", timestamp=0, count=5),
+            _alert("detect_sql_injection", timestamp=10, dst_ip="10.0.0.3",
+                   count=2),
+        ]
+        incidents = detections.build_incident_timelines(alerts)
+        assert len(incidents) == 1
+        assert len(incidents[0]["alerts"]) == 2
+        assert incidents[0]["total_alerts"] == 7
+        assert incidents[0]["duration_sec"] == 10.0
